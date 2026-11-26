@@ -139,7 +139,10 @@ class FileUtils {
           throw new HttpError("Empty filename!");
         }
         $tmpfile = Factory::getStoredValueFactory()->get(DDirectories::FILES)->getVal() . "/" . $realname;
-        $resp = Util::uploadFile($tmpfile, 'paste', $post['data']);
+        /* When _uploadType is base64_file, $post['data'] holds a path to a temp
+         * file with base64 data that is stream-decoded to disk (no full decode in RAM). */
+        $uploadType = (isset($post['_uploadType']) && $post['_uploadType'] === 'base64_file') ? 'base64_file' : 'paste';
+        $resp = Util::uploadFile($tmpfile, $uploadType, $post['data']);
         if ($resp[0]) {
           $resp = Util::insertFile($tmpfile, $realname, $view, $accessGroup->getId());
           if ($resp) {

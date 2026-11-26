@@ -1192,6 +1192,36 @@ class Util {
             $msg = "Unable to save pasted content!";
           }
           break;
+
+        case "base64_file":
+          /* $sourcedata is a path to a temporary file holding base64-encoded data.
+           * Stream-decode directly to $target so the decoded binary is never held
+           * in RAM (critical for large wordlists on low-RAM hosts). */
+          $b64Path = $sourcedata;
+          if (!file_exists($b64Path) || !is_readable($b64Path)) {
+            $msg = "Base64 source file not found or not readable!";
+            break;
+          }
+          $input = @fopen($b64Path, 'rb');
+          $output = @fopen($target, 'wb');
+          if (!$input || !$output) {
+            $msg = "Could not open files for base64 stream decode!";
+            if ($input) { fclose($input); }
+            if ($output) { fclose($output); }
+            break;
+          }
+          stream_filter_append($input, 'convert.base64-decode');
+          $copied = stream_copy_to_stream($input, $output);
+          fclose($input);
+          fclose($output);
+          @unlink($b64Path);
+          if ($copied === false) {
+            $msg = "Failed to stream-decode base64 data!";
+          }
+          else {
+            $success = true;
+          }
+          break;
         
         case "upload":
           $hashfile = $sourcedata;

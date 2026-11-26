@@ -21,6 +21,11 @@ use Hashtopolis\inc\apiv2\error\HttpError;
 use Hashtopolis\inc\HTException;
 use Hashtopolis\inc\Util;
 
+use Psr\Http\Message\ResponseInterface as Response;
+use Psr\Http\Message\ServerRequestInterface as Request;
+use Slim\App;
+use Slim\Routing\RouteCollectorProxy;
+
 
 /**
  * @extends AbstractModelAPI<File>
@@ -118,11 +123,15 @@ class FileAPI extends AbstractModelAPI {
     switch ($data["sourceType"]) {
       case "inline":
         // TODO: Should be validated as parameter input instead
-        $decoded = base64_decode($data["sourceData"], true);
-        if ($decoded === false) {
-          throw new HttpError("sourceData not valid base64 encoding");
+        /* Write base64 to a temp file first, then stream-decode to disk via
+         * Util::uploadFile(base64_file). This avoids holding the entire decoded
+         * binary in RAM, which matters for large wordlists on low-RAM hosts. */
+        $b64Temp = $this->getFilesPath() . $realname . '.b64';
+        if (!file_put_contents($b64Temp, $data["sourceData"])) {
+          throw new HttpError("Failed to write base64 data to temporary file!");
         }
-        $dummyPost["data"] = $decoded;
+        $dummyPost["_uploadType"] = "base64_file";
+        $dummyPost["data"] = $b64Temp;
         break;
       case "import":
         $realname = str_replace(" ", "_", htmlentities(basename($data["sourceData"]), ENT_QUOTES, "UTF-8"));
@@ -210,6 +219,126 @@ class FileAPI extends AbstractModelAPI {
    */
   protected function deleteObject(AbstractModel $object): void {
     FileUtils::delete($object->getId(), $this->getCurrentUser());
+  }
+
+  /**
+   * Upload a file via multipart/form-data.
+   *
+   * PHP's SAPI writes the uploaded file directly to a temp file on disk
+   * (upload_tmp_dir). We then move_uploaded_file() it to its final
+   * destination, so the file contents are never held in application RAM.
+   * This supports huge wordlists (e.g. 30+ GB) on extremely low-RAM hosts.
+   *
+   * Form fields: filename (optional), accessGroupId (required), fileType
+   * (optional, default OTHER), isSecret (optional).
+   * File field: upfile
+   *
+   * @param Request $request
+   * @param Response $response
+   * @param array $args
+   * @return Response
+   * @throws HttpError
+   * @throws Exception
+   */
+  public function processUpload(Request $request, Response $response, array $args): Response {
+    $this->preCommon($request);
+
+    $post = $request->getParsedBody() ?? [];
+
+    if (!isset($_FILES['upfile']) || !is_array($_FILES['upfile']) ||
+      $_FILES['upfile']['error'] !== UPLOAD_ERR_OK) {
+      $err = isset($_FILES['upfile']['error']) ? $_FILES['upfile']['error'] : -1;
+      throw new HttpError("No file uploaded or upload error (code $err)", 400);
+    }
+
+    $accessGroupId = $post['accessGroupId'] ?? null;
+    if ($accessGroupId === null) {
+      throw new HttpError("accessGroupId is required", 400);
+    }
+
+    $fileType = intval($post['fileType'] ?? DFileType::OTHER);
+    $isSecret = !empty($post['isSecret']);
+
+    $view = [
+      DFileType::OTHER => 'other',
+      DFileType::RULE => 'rule',
+      DFileType::WORDLIST => 'dict'
+    ][$fileType] ?? 'other';
+
+    /* Normalize $_FILES so that single-file uploads (string values) are
+     * presented as arrays, matching what FileUtils::add("upload", ...)
+     * expects. PHP's SAPI already wrote the file to a temp file on disk;
+     * we only restructure the metadata array, never the file contents. */
+    $files = $_FILES;
+    foreach ($files as $field => $fileData) {
+      if (isset($fileData['name']) && !is_array($fileData['name'])) {
+        $files[$field] = [
+          'name' => [$fileData['name']],
+          'type' => [$fileData['type'] ?? ''],
+          'tmp_name' => [$fileData['tmp_name']],
+          'error' => [$fileData['error']],
+          'size' => [$fileData['size'] ?? 0],
+        ];
+      }
+    }
+
+    /* FileUtils::add("upload", ...) uses move_uploaded_file, which moves
+     * the PHP SAPI temp file to the final destination. The file contents
+     * are never read into application RAM. */
+    $fileCount = FileUtils::add("upload", $files, [
+      "accessGroupId" => $accessGroupId,
+    ], $view);
+
+    if ($fileCount === 0) {
+      throw new HttpError("File upload failed", 400);
+    }
+
+    /* Determine the stored filename from the uploaded file's original name */
+    $uploaded = $files['upfile'];
+    $realname = str_replace(" ", "_", htmlentities(basename($uploaded["name"][0]), ENT_QUOTES, "UTF-8"));
+
+    /* Look up the created file record */
+    $qFs = [
+      new QueryFilter(File::FILENAME, $realname, '='),
+      new QueryFilter(File::ACCESS_GROUP_ID, $accessGroupId, '=')
+    ];
+    $oF = new OrderFilter(File::FILE_ID, "DESC");
+    $objects = $this->getFactory()->filter([Factory::FILTER => $qFs, Factory::ORDER => $oF]);
+
+    if (count($objects) == 0) {
+      throw new HttpError("Failed to retrieve uploaded file", 500);
+    }
+
+    if ($isSecret) {
+      FileUtils::switchSecret($objects[0]->getId(), 1, $this->getCurrentUser());
+    }
+
+    $response->getBody()->write(json_encode([
+      "id" => $objects[0]->getId(),
+      "filename" => $realname,
+    ]));
+
+    return $response->withStatus(201)
+      ->withHeader("Content-Type", "application/json")
+      ->withHeader("Access-Control-Expose-Headers", "Content-Type");
+  }
+
+  /**
+   * Register routes including the multipart upload endpoint.
+   */
+  static public function register(App $app): void {
+    $me = static::class;
+    parent::register($app);
+
+    $baseUri = $me::getBaseUri();
+
+    $app->group($baseUri, function (RouteCollectorProxy $group) use ($me) {
+      $group->post('/upload', [$me, 'processUpload'])
+        ->setName($me . ':processUpload');
+      $group->options('/upload', function (Request $request, Response $response): Response {
+        return $response->withStatus(204);
+      });
+    });
   }
 }
 
