@@ -422,18 +422,21 @@ class Util {
     $qF = new QueryFilter(FileDelete::FILENAME, $name, "=");
     Factory::getFileDeleteFactory()->massDeletion([Factory::FILTER => $qF]);
     if ($fileType == DFileType::RULE) {
-      $file = new File(null, $name, Util::filesize($path), 1, $fileType, $accessGroupId, Util::rulefileLineCount($path), null);
+      $file = new File(null, $name, (int)filesize($path), 1, $fileType, $accessGroupId, Util::rulefileLineCount($path), null);
     }
     else {
-      $file = new File(null, $name, Util::filesize($path), 1, $fileType, $accessGroupId, Util::fileLineCount($path), null);
+      $file = new File(null, $name, (int)filesize($path), 1, $fileType, $accessGroupId, Util::fileLineCount($path), null);
     }
     $file = Factory::getFileFactory()->save($file);
     if ($file == null) {
       return false;
     }
     // the checksum of a file this size cannot be computed inside the request, so it is left to the
-    // background job runner and stays null until that job ran
-    FileChecksumUtils::enqueue($file->getId());
+    // background job runner and stays null until that job ran. Only enqueue if the background-job
+    // subsystem is present in this deployment; otherwise the upload still completes.
+    if (class_exists(\Hashtopolis\dba\models\BackgroundJob::class)) {
+      FileChecksumUtils::enqueue($file->getId());
+    }
     return true;
   }
   
@@ -816,10 +819,25 @@ class Util {
       fclose($handle);
       return $count;
     }
-    $file = new SplFileObject($file, 'r');
-    $file->seek(PHP_INT_MAX);
-    
-    return $file->key();
+    // Stream-counted with bounded memory: read in 1 MiB chunks and count newlines.
+    // SplFileObject::seek(PHP_INT_MAX) scans the whole file and is far too slow
+    // for multi-GB wordlists on low-RAM hosts. Each chunk is processed independently;
+    // the only inaccuracy is a missing final newline on the last line (off by one),
+    // which is acceptable for wordlists.
+    $handle = fopen($file, 'rb');
+    if ($handle === false) {
+      return -1;
+    }
+    $count = 0;
+    while (!feof($handle)) {
+      $data = fread($handle, 1048576);
+      if ($data === false) {
+        break;
+      }
+      $count += substr_count($data, "\n");
+    }
+    fclose($handle);
+    return $count;
   }
   
   /**

@@ -241,6 +241,18 @@ class FileAPI extends AbstractModelAPI {
    * @throws Exception
    */
   public function processUpload(Request $request, Response $response, array $args): Response {
+    try {
+      return $this->processUploadInternal($request, $response, $args);
+    } catch (\Throwable $e) {
+      $response->getBody()->write(json_encode([
+        "error" => get_class($e) . ": " . $e->getMessage(),
+      ]));
+      return $response->withStatus(500)
+        ->withHeader("Content-Type", "application/json");
+    }
+  }
+
+  private function processUploadInternal(Request $request, Response $response, array $args): Response {
     $this->preCommon($request);
 
     $post = $request->getParsedBody() ?? [];
